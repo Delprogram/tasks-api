@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Message
-        run: echo "Bonjour depuis GitHub Actions !"
+        run: echo "Bonjour !"
 
       - name: Branche et auteur
         run: |
