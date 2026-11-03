@@ -19,7 +19,3 @@ def test_is_valid_title_rejects_empty():
 
 def test_is_valid_title_rejects_too_long():
     assert is_valid_title("a" * (MAX_TITLE_LENGTH + 1)) is False
-
-
-def test_echec_volontaire():
-    assert 1 == 2
