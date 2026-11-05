@@ -1,0 +1,8 @@
+services:
+  api:
+    build: .
+    image: tasks-api:local
+    ports:
+      - "8000:8000"
+    environment:
+      APP_VERSION: local
