@@ -1,0 +1,70 @@
+name: TP3 local (démo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Version publiée à tester depuis GHCR (vide = ignorer)"
+        required: false
+        default: ""
+
+jobs:
+  docker-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: "TP3-1 : docker build"
+        run: docker build -t tasks-api:local .
+
+      - name: "Taille de l'image"
+        run: docker images tasks-api
+
+      - name: "TP3-1 : docker run puis curl /health et /version"
+        run: |
+          docker run -d --name api -p 8000:8000 tasks-api:local
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:8000/health; then echo; break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8000/version
+          echo
+          docker stop api
+
+      - name: "Cache : modification de app/ puis nouveau build"
+        run: |
+          echo "# modification pour tester le cache" >> app/logic.py
+          docker build --progress=plain -t tasks-api:local . 2>&1 | grep -E "^#[0-9]+ (\[|CACHED)"
+
+      - name: "TP3-2 : docker compose up puis curl /version"
+        run: |
+          git checkout app/logic.py
+          docker compose up --build -d
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then break; fi
+            sleep 1
+          done
+          docker compose ps
+          curl -fsS http://localhost:8000/version
+          echo
+          docker compose down
+
+      - name: "TP3-8 : id dans le conteneur"
+        run: docker run --rm tasks-api:local id
+
+  ghcr-release:
+    if: inputs.release != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: "TP3-6 : image téléchargée depuis GHCR puis curl /version"
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tasks-api:${{ inputs.release }}"
+          docker images
+          docker run -d --name api -p 8000:8000 "$IMAGE"
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8000/version
+          echo
+          docker stop api
