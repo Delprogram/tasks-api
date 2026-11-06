@@ -1,0 +1,204 @@
+name: TP4 GitOps (kind + Argo CD)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version attendue dans tasks-config pour la partie 4"
+        required: true
+        default: "0.2.0"
+
+permissions:
+  contents: write
+
+jobs:
+  gitops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SHOTS: ${{ github.workspace }}/captures
+    steps:
+      - name: Récupérer le dépôt applicatif
+        uses: actions/checkout@v6
+
+      - name: Récupérer le dépôt tasks-config
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/tasks-config
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Outils (kind, Playwright, scripts)
+        run: |
+          mkdir -p "$SHOTS"
+          if ! command -v kind > /dev/null; then
+            curl -sSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+            chmod +x kind && sudo mv kind /usr/local/bin/kind
+          fi
+          kind version
+          kubectl version --client
+          pip install --quiet playwright
+          python -m playwright install --with-deps chromium > /dev/null
+          cat > /tmp/shot.py <<'PY'
+          import os, sys, time
+          from playwright.sync_api import sync_playwright
+          mode, out = sys.argv[1], sys.argv[2]
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page(ignore_https_errors=True, viewport={"width": 1500, "height": 850})
+              page.goto("https://localhost:8080/login", wait_until="domcontentloaded")
+              page.wait_for_selector("input[type=password]", timeout=60000)
+              time.sleep(2)
+              if mode == "login":
+                  page.screenshot(path=out)
+                  sys.exit(0)
+              page.locator("input").first.fill("admin")
+              page.fill("input[type=password]", os.environ["ARGO_PWD"])
+              page.keyboard.press("Enter")
+              page.wait_for_url("**/applications**", timeout=60000)
+              page.goto("https://localhost:8080/applications/argocd/tasks-api", wait_until="domcontentloaded")
+              time.sleep(8)
+              page.screenshot(path=out)
+          PY
+          cat > /tmp/wait.sh <<'SH'
+          want="$1"
+          kubectl -n argocd annotate application tasks-api argocd.argoproj.io/refresh=hard --overwrite > /dev/null
+          for i in $(seq 1 72); do
+            S=$(kubectl -n argocd get application tasks-api -o jsonpath='{.status.sync.status} {.status.health.status}' 2>/dev/null)
+            R=$(kubectl -n tasks get deploy tasks-api -o jsonpath='{.spec.replicas}' 2>/dev/null)
+            echo "Argo CD : $S | replicas : ${R:-?} (attendu $want)"
+            if [ "$S" = "Synced Healthy" ] && [ "$R" = "$want" ]; then break; fi
+            sleep 5
+          done
+          kubectl rollout status deploy/tasks-api -n tasks --timeout=180s
+          SH
+
+      - name: "TP4-1 : création du cluster puis kubectl get nodes"
+        run: |
+          kind create cluster --name gitops --wait 120s
+          kubectl get nodes
+
+      - name: "Installation d'Argo CD"
+        run: |
+          kubectl create namespace argocd
+          kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml > /dev/null
+          kubectl wait --for=condition=Ready pods --all -n argocd --timeout=300s
+
+      - name: "TP4-2 : pods Argo CD et page de connexion"
+        run: |
+          kubectl get pods -n argocd
+          nohup kubectl port-forward svc/argocd-server -n argocd 8080:443 > /tmp/pf-argocd.log 2>&1 &
+          ARGO_PWD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          echo "::add-mask::$ARGO_PWD"
+          echo "ARGO_PWD=$ARGO_PWD" >> "$GITHUB_ENV"
+          sleep 5
+          python /tmp/shot.py login "$SHOTS/tp4-2-login.png"
+
+      - name: "TP4-3 : application Synced et Healthy avec 2 pods"
+        run: |
+          kubectl apply -f argocd/application.yaml
+          bash /tmp/wait.sh 2
+          kubectl get pods -n tasks
+          python /tmp/shot.py app "$SHOTS/tp4-3-argocd-2pods.png"
+
+      - name: "TP4-4 : /version dans le cluster"
+        run: |
+          nohup kubectl port-forward svc/tasks-api -n tasks 8081:80 > /tmp/pf-api1.log 2>&1 &
+          sleep 5
+          curl -s http://localhost:8081/version
+          echo
+
+      - name: "TP4-5 : replicas 2 -> 3 par un commit Git"
+        run: |
+          cd config
+          git config user.name "Delprogram"
+          git config user.email "Delprogram@users.noreply.github.com"
+          sed -i 's/replicas: 2/replicas: 3/' k8s/deployment.yaml
+          git commit -am "Passe replicas de 2 à 3"
+          git push
+          git log --oneline -3
+          bash /tmp/wait.sh 3
+          kubectl get pods -n tasks
+          python /tmp/shot.py app "$SHOTS/tp4-5-argocd-3pods.png"
+
+      - name: "TP4-6 : dérive manuelle (kubectl scale à 5)"
+        run: |
+          kubectl scale deployment tasks-api -n tasks --replicas=5
+          sleep 1
+          kubectl get pods -n tasks
+          python /tmp/shot.py app "$SHOTS/tp4-6a-apres-scale.png"
+
+      - name: "TP4-6 : correction automatique par Argo CD (selfHeal)"
+        run: |
+          bash /tmp/wait.sh 3
+          sleep 15
+          kubectl get pods -n tasks
+          kubectl get deploy tasks-api -n tasks
+          python /tmp/shot.py app "$SHOTS/tp4-6b-selfheal.png"
+
+      - name: "TP4-7 : git revert puis retour à 2 pods"
+        run: |
+          cd config
+          git revert --no-edit HEAD
+          git push
+          git log --oneline -5
+          bash /tmp/wait.sh 2
+          sleep 15
+          kubectl get pods -n tasks
+          python /tmp/shot.py app "$SHOTS/tp4-7-revert-2pods.png"
+
+      - name: "Partie 4 : attente du commit automatique de update-config"
+        timeout-minutes: 45
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd config
+          until git pull -q && grep -q "tasks-api:$VERSION" k8s/deployment.yaml; do
+            echo "En attente de la version $VERSION dans tasks-config..."
+            sleep 20
+          done
+          git log --oneline -5
+
+      - name: "TP4-9 : Argo CD synchronisé sur la nouvelle version"
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          bash /tmp/wait.sh 2
+          sleep 15
+          kubectl get pods -n tasks
+          kubectl get deploy tasks-api -n tasks -o jsonpath='{.spec.template.spec.containers[0].image}'
+          echo
+          python /tmp/shot.py app "$SHOTS/tp4-9-argocd-version.png"
+
+      - name: "TP4-10 : /version répond la nouvelle version"
+        run: |
+          pkill -f "port-forward svc/tasks-api" || true
+          nohup kubectl port-forward svc/tasks-api -n tasks 8082:80 > /tmp/pf-api2.log 2>&1 &
+          sleep 5
+          curl -s http://localhost:8082/version
+          echo
+
+      - name: Publier les captures (branche tp4-captures)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd "$SHOTS"
+          ls -la
+          git init -q
+          git checkout -q -b tp4-captures
+          git add .
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "Captures Argo CD du TP4"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" tp4-captures
+
+      - name: Captures en artefact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: captures-tp4
+          path: captures
