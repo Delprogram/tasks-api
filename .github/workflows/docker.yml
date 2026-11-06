@@ -142,3 +142,33 @@ jobs:
       - name: Logs du conteneur
         if: always()
         run: docker logs api
+
+  update-config:
+    needs: [build, deploy-production]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Récupérer le dépôt applicatif
+        uses: actions/checkout@v6
+
+      - name: Récupérer le dépôt tasks-config
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/tasks-config
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      - name: Mettre à jour la version dans tasks-config
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          bash scripts/set-image-tag.sh config/k8s/deployment.yaml "$VERSION"
+          cd config
+          git diff
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add k8s/deployment.yaml
+          git commit -m "Déploie tasks-api $VERSION"
+          git push
